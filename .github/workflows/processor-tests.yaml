@@ -1,0 +1,23 @@
+name: Bitcoin Tests
+
+on:
+  push:
+    branches:
+      - develop
+
+jobs:
+  # Only run these once since they will be consistent regardless of any node
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Test Dependencies
+        uses: ./.github/actions/test-dependencies
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Unit Tests Without Features
+        run: cargo test --package serai-processor --lib
+
+      # Doesn't run unit tests with features as the tests workflow will
