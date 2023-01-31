@@ -7,22 +7,24 @@ use std::{
 use rand_core::{RngCore, CryptoRng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
+use group::ff::Field;
 use curve25519_dalek::{traits::Identity, scalar::Scalar, edwards::EdwardsPoint};
+use dalek_ff_group as dfg;
 
 use transcript::{Transcript, RecommendedTranscript};
 use frost::{
   curve::Ed25519,
   FrostError, ThresholdKeys,
   sign::{
-    Writable, Preprocess, SignatureShare, PreprocessMachine, SignMachine, SignatureMachine,
-    AlgorithmMachine, AlgorithmSignMachine, AlgorithmSignatureMachine,
+    Writable, Preprocess, CachedPreprocess, SignatureShare, PreprocessMachine, SignMachine,
+    SignatureMachine, AlgorithmMachine, AlgorithmSignMachine, AlgorithmSignatureMachine,
   },
 };
 
 use crate::{
   random_scalar,
   ringct::{
-    clsag::{ClsagInput, ClsagDetails, ClsagAddendum, ClsagMultisig},
+    clsag::{ClsagInput, ClsagDetails, ClsagAddendum, ClsagMultisig, add_key_image_share},
     RctPrunable,
   },
   transaction::{Input, Transaction},
@@ -34,11 +36,12 @@ use crate::{
 pub struct TransactionMachine {
   signable: SignableTransaction,
   i: u16,
-  included: Vec<u16>,
   transcript: RecommendedTranscript,
 
   decoys: Vec<Decoys>,
 
+  // Hashed key and scalar offset
+  key_images: Vec<(EdwardsPoint, Scalar)>,
   inputs: Vec<Arc<RwLock<Option<ClsagDetails>>>>,
   clsags: Vec<AlgorithmMachine<Ed25519, ClsagMultisig>>,
 }
@@ -46,11 +49,11 @@ pub struct TransactionMachine {
 pub struct TransactionSignMachine {
   signable: SignableTransaction,
   i: u16,
-  included: Vec<u16>,
   transcript: RecommendedTranscript,
 
   decoys: Vec<Decoys>,
 
+  key_images: Vec<(EdwardsPoint, Scalar)>,
   inputs: Vec<Arc<RwLock<Option<ClsagDetails>>>>,
   clsags: Vec<AlgorithmSignMachine<Ed25519, ClsagMultisig>>,
 
@@ -71,7 +74,6 @@ impl SignableTransaction {
     keys: ThresholdKeys<Ed25519>,
     mut transcript: RecommendedTranscript,
     height: usize,
-    mut included: Vec<u16>,
   ) -> Result<TransactionMachine, TransactionError> {
     let mut inputs = vec![];
     for _ in 0 .. self.inputs.len() {
@@ -90,44 +92,40 @@ impl SignableTransaction {
     // Include the height we're using for our data
     // The data itself will be included, making this unnecessary, yet a lot of this is technically
     // unnecessary. Anything which further increases security at almost no cost should be followed
-    transcript.append_message(b"height", &u64::try_from(height).unwrap().to_le_bytes());
+    transcript.append_message(b"height", u64::try_from(height).unwrap().to_le_bytes());
     // Also include the spend_key as below only the key offset is included, so this transcripts the
     // sum product
     // Useful as transcripting the sum product effectively transcripts the key image, further
     // guaranteeing the one time properties noted below
-    transcript.append_message(b"spend_key", &keys.group_key().0.compress().to_bytes());
+    transcript.append_message(b"spend_key", keys.group_key().0.compress().to_bytes());
     for input in &self.inputs {
       // These outputs can only be spent once. Therefore, it forces all RNGs derived from this
       // transcript (such as the one used to create one time keys) to be unique
-      transcript.append_message(b"input_hash", &input.output.absolute.tx);
-      transcript.append_message(b"input_output_index", &[input.output.absolute.o]);
+      transcript.append_message(b"input_hash", input.output.absolute.tx);
+      transcript.append_message(b"input_output_index", [input.output.absolute.o]);
       // Not including this, with a doxxed list of payments, would allow brute forcing the inputs
       // to determine RNG seeds and therefore the true spends
-      transcript.append_message(b"input_shared_key", &input.key_offset().to_bytes());
+      transcript.append_message(b"input_shared_key", input.key_offset().to_bytes());
     }
     for payment in &self.payments {
       transcript.append_message(b"payment_address", payment.0.to_string().as_bytes());
-      transcript.append_message(b"payment_amount", &payment.1.to_le_bytes());
+      transcript.append_message(b"payment_amount", payment.1.to_le_bytes());
     }
 
-    // Sort included before cloning it around
-    included.sort_unstable();
-
+    let mut key_images = vec![];
     for (i, input) in self.inputs.iter().enumerate() {
       // Check this the right set of keys
-      let offset = keys.offset(dalek_ff_group::Scalar(input.key_offset()));
+      let offset = keys.offset(dfg::Scalar(input.key_offset()));
       if offset.group_key().0 != input.key() {
         Err(TransactionError::WrongPrivateKey)?;
       }
 
-      clsags.push(
-        AlgorithmMachine::new(
-          ClsagMultisig::new(transcript.clone(), input.key(), inputs[i].clone()),
-          offset,
-          &included,
-        )
-        .map_err(TransactionError::FrostError)?,
-      );
+      let clsag = ClsagMultisig::new(transcript.clone(), input.key(), inputs[i].clone());
+      key_images.push((
+        clsag.H,
+        keys.current_offset().unwrap_or_else(dfg::Scalar::zero).0 + self.inputs[i].key_offset(),
+      ));
+      clsags.push(AlgorithmMachine::new(clsag, offset).map_err(TransactionError::FrostError)?);
     }
 
     // Select decoys
@@ -150,11 +148,11 @@ impl SignableTransaction {
     Ok(TransactionMachine {
       signable: self,
       i: keys.params().i(),
-      included,
       transcript,
 
       decoys,
 
+      key_images,
       inputs,
       clsags,
     })
@@ -196,11 +194,11 @@ impl PreprocessMachine for TransactionMachine {
       TransactionSignMachine {
         signable: self.signable,
         i: self.i,
-        included: self.included,
         transcript: self.transcript,
 
         decoys: self.decoys,
 
+        key_images: self.key_images,
         inputs: self.inputs,
         clsags,
 
@@ -212,9 +210,25 @@ impl PreprocessMachine for TransactionMachine {
 }
 
 impl SignMachine<Transaction> for TransactionSignMachine {
+  type Params = ();
+  type Keys = ThresholdKeys<Ed25519>;
   type Preprocess = Vec<Preprocess<Ed25519, ClsagAddendum>>;
   type SignatureShare = Vec<SignatureShare<Ed25519>>;
   type SignatureMachine = TransactionSignatureMachine;
+
+  fn cache(self) -> CachedPreprocess {
+    unimplemented!(
+      "Monero transactions don't support caching their preprocesses due to {}",
+      "being already bound to a specific transaction"
+    );
+  }
+
+  fn from_cache(_: (), _: ThresholdKeys<Ed25519>, _: CachedPreprocess) -> Result<Self, FrostError> {
+    unimplemented!(
+      "Monero transactions don't support caching their preprocesses due to {}",
+      "being already bound to a specific transaction"
+    );
+  }
 
   fn read_preprocess<R: Read>(&self, reader: &mut R) -> io::Result<Self::Preprocess> {
     self.clsags.iter().map(|clsag| clsag.read_preprocess(reader)).collect()
@@ -231,19 +245,25 @@ impl SignMachine<Transaction> for TransactionSignMachine {
       ))?;
     }
 
+    // Find out who's included
+    // This may not be a valid set of signers yet the algorithm machine will error if it's not
+    commitments.remove(&self.i); // Remove, if it was included for some reason
+    let mut included = commitments.keys().cloned().collect::<Vec<_>>();
+    included.push(self.i);
+    included.sort_unstable();
+
     // Convert the unified commitments to a Vec of the individual commitments
     let mut images = vec![EdwardsPoint::identity(); self.clsags.len()];
     let mut commitments = (0 .. self.clsags.len())
       .map(|c| {
-        self
-          .included
+        included
           .iter()
           .map(|l| {
             // Add all commitments to the transcript for their entropy
             // While each CLSAG will do this as they need to for security, they have their own
             // transcripts cloned from this TX's initial premise's transcript. For our TX
             // transcript to have the CLSAG data for entropy, it'll have to be added ourselves here
-            self.transcript.append_message(b"participant", &(*l).to_be_bytes());
+            self.transcript.append_message(b"participant", (*l).to_be_bytes());
 
             let preprocess = if *l == self.i {
               self.our_preprocess[c].clone()
@@ -254,7 +274,7 @@ impl SignMachine<Transaction> for TransactionSignMachine {
             {
               let mut buf = vec![];
               preprocess.write(&mut buf).unwrap();
-              self.transcript.append_message(b"preprocess", &buf);
+              self.transcript.append_message(b"preprocess", buf);
             }
 
             // While here, calculate the key image
@@ -262,7 +282,14 @@ impl SignMachine<Transaction> for TransactionSignMachine {
             // provides the easiest API overall, as this is where the TX is (which needs the key
             // images in its message), along with where the outputs are determined (where our
             // outputs may need these in order to guarantee uniqueness)
-            images[c] += preprocess.addendum.key_image.0;
+            add_key_image_share(
+              &mut images[c],
+              self.key_images[c].0,
+              self.key_images[c].1,
+              &included,
+              *l,
+              preprocess.addendum.key_image.0,
+            );
 
             Ok((*l, preprocess))
           })

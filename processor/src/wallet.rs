@@ -39,7 +39,7 @@ impl<C: Curve> WalletKeys<C> {
     let mut transcript = RecommendedTranscript::new(DST);
     transcript.append_message(b"chain", chain);
     transcript.append_message(b"curve", C::ID);
-    transcript.append_message(b"group_key", self.keys.group_key().to_bytes().as_ref());
+    transcript.append_message(b"group_key", self.keys.group_key().to_bytes());
     self.keys.offset(<C as Ciphersuite>::hash_to_F(DST, &transcript.challenge(b"offset")))
   }
 }
@@ -60,7 +60,7 @@ pub trait CoinDb {
 }
 
 pub struct MemCoinDb {
-  // Height this coin has been scanned to
+  // Block number of the block this coin has been scanned to
   scanned_block: usize,
   // Acknowledged block for a given canonical block
   acknowledged_blocks: HashMap<usize, usize>,
@@ -180,6 +180,7 @@ fn refine_inputs<C: Coin>(
   }
 }
 
+#[allow(clippy::type_complexity)]
 fn select_inputs_outputs<C: Coin>(
   inputs: &mut Vec<C::Output>,
   outputs: &mut Vec<(C::Address, u64)>,
@@ -200,6 +201,7 @@ fn select_inputs_outputs<C: Coin>(
   (selected, outputs)
 }
 
+#[allow(clippy::type_complexity)]
 pub struct Wallet<D: CoinDb, C: Coin> {
   db: D,
   coin: C,
@@ -223,16 +225,14 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
   }
 
   pub fn add_keys(&mut self, keys: &WalletKeys<C::Curve>) {
-    self.pending.push((self.acknowledged_block(keys.creation_block), keys.bind(C::ID)));
+    let creation_block = keys.creation_block;
+    let mut keys = keys.bind(C::ID);
+    self.coin.tweak_keys(&mut keys);
+    self.pending.push((self.acknowledged_block(creation_block), keys));
   }
 
   pub fn address(&self) -> C::Address {
     self.coin.address(self.keys[self.keys.len() - 1].0.group_key())
-  }
-
-  // TODO: Remove
-  pub async fn is_confirmed(&mut self, tx: &[u8]) -> Result<bool, CoinError> {
-    self.coin.is_confirmed(tx).await
   }
 
   pub async fn poll(&mut self) -> Result<(), CoinError> {
@@ -265,8 +265,7 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
             .coin
             .get_outputs(&block, keys.group_key())
             .await?
-            .iter()
-            .cloned()
+            .drain(..)
             .filter(|output| self.db.add_output(output)),
         );
       }
@@ -285,7 +284,7 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
   pub async fn prepare_sends(
     &mut self,
     canonical: usize,
-    payments: Vec<(C::Address, u64)>,
+    mut payments: Vec<(C::Address, u64)>,
     fee: C::Fee,
   ) -> Result<(Vec<(C::Address, u64)>, Vec<C::SignableTransaction>), CoinError> {
     if payments.is_empty() {
@@ -299,7 +298,6 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
     // As each payment re-appears, let mut payments = schedule[payment] where the only input is
     // the source payment
     // let (mut payments, schedule) = schedule(payments);
-    let mut payments = payments;
 
     let mut txs = vec![];
     for (keys, outputs) in self.keys.iter_mut() {
@@ -314,16 +312,24 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
         // Create the transcript for this transaction
         let mut transcript = RecommendedTranscript::new(b"Serai Processor Wallet Send");
         transcript
-          .append_message(b"canonical_block", &u64::try_from(canonical).unwrap().to_le_bytes());
+          .append_message(b"canonical_block", u64::try_from(canonical).unwrap().to_le_bytes());
         transcript.append_message(
           b"acknowledged_block",
-          &u64::try_from(acknowledged_block).unwrap().to_le_bytes(),
+          u64::try_from(acknowledged_block).unwrap().to_le_bytes(),
         );
-        transcript.append_message(b"index", &u64::try_from(txs.len()).unwrap().to_le_bytes());
+        transcript.append_message(b"index", u64::try_from(txs.len()).unwrap().to_le_bytes());
 
         let tx = self
           .coin
-          .prepare_send(keys.clone(), transcript, acknowledged_block, inputs, &outputs, fee)
+          .prepare_send(
+            keys.clone(),
+            transcript,
+            acknowledged_block,
+            inputs,
+            &outputs,
+            Some(keys.group_key()),
+            fee,
+          )
           .await?;
         // self.db.save_tx(tx) // TODO
         txs.push(tx);
@@ -337,10 +343,8 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
     &mut self,
     network: &mut N,
     prepared: C::SignableTransaction,
-    included: Vec<u16>,
-  ) -> Result<(Vec<u8>, Vec<<C::Output as Output>::Id>), SignError> {
-    let attempt =
-      self.coin.attempt_send(prepared, &included).await.map_err(SignError::CoinError)?;
+  ) -> Result<Vec<u8>, SignError> {
+    let attempt = self.coin.attempt_send(prepared).await.map_err(SignError::CoinError)?;
 
     let (attempt, commitments) = attempt.preprocess(&mut OsRng);
     let commitments = network

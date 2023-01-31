@@ -1,8 +1,10 @@
+use core::ops::Deref;
+
 use thiserror::Error;
 
 use rand_core::{RngCore, CryptoRng};
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use digest::{Digest, HashMarker};
 
@@ -18,7 +20,7 @@ pub mod scalar;
 use scalar::{scalar_convert, mutual_scalar_from_bytes};
 
 pub(crate) mod schnorr;
-use schnorr::SchnorrPoK;
+use self::schnorr::SchnorrPoK;
 
 pub(crate) mod aos;
 
@@ -52,8 +54,8 @@ impl<G: PrimeGroup> Generators<G> {
 
   fn transcript<T: Transcript>(&self, transcript: &mut T) {
     transcript.domain_separate(b"generators");
-    transcript.append_message(b"primary", self.primary.to_bytes().as_ref());
-    transcript.append_message(b"alternate", self.alt.to_bytes().as_ref());
+    transcript.append_message(b"primary", self.primary.to_bytes());
+    transcript.append_message(b"alternate", self.alt.to_bytes());
   }
 }
 
@@ -153,8 +155,8 @@ where
     generators.0.transcript(transcript);
     generators.1.transcript(transcript);
     transcript.domain_separate(b"points");
-    transcript.append_message(b"point_0", keys.0.to_bytes().as_ref());
-    transcript.append_message(b"point_1", keys.1.to_bytes().as_ref());
+    transcript.append_message(b"point_0", keys.0.to_bytes());
+    transcript.append_message(b"point_1", keys.1.to_bytes());
   }
 
   pub(crate) fn blinding_key<R: RngCore + CryptoRng, F: PrimeField>(
@@ -181,21 +183,22 @@ where
     res
   }
 
+  #[allow(clippy::type_complexity)]
   fn prove_internal<R: RngCore + CryptoRng, T: Clone + Transcript>(
     rng: &mut R,
     transcript: &mut T,
     generators: (Generators<G0>, Generators<G1>),
-    f: (G0::Scalar, G1::Scalar),
-  ) -> (Self, (G0::Scalar, G1::Scalar)) {
+    f: (Zeroizing<G0::Scalar>, Zeroizing<G1::Scalar>),
+  ) -> (Self, (Zeroizing<G0::Scalar>, Zeroizing<G1::Scalar>)) {
     Self::transcript(
       transcript,
       generators,
-      ((generators.0.primary * f.0), (generators.1.primary * f.1)),
+      ((generators.0.primary * f.0.deref()), (generators.1.primary * f.1.deref())),
     );
 
     let poks = (
-      SchnorrPoK::<G0>::prove(rng, transcript, generators.0.primary, f.0),
-      SchnorrPoK::<G1>::prove(rng, transcript, generators.1.primary, f.1),
+      SchnorrPoK::<G0>::prove(rng, transcript, generators.0.primary, &f.0),
+      SchnorrPoK::<G1>::prove(rng, transcript, generators.1.primary, &f.1),
     );
 
     let mut blinding_key_total = (G0::Scalar::zero(), G1::Scalar::zero());
@@ -269,7 +272,7 @@ where
     let proof = __DLEqProof { bits, remainder, poks };
     debug_assert_eq!(
       proof.reconstruct_keys(),
-      (generators.0.primary * f.0, generators.1.primary * f.1)
+      (generators.0.primary * f.0.deref(), generators.1.primary * f.1.deref())
     );
     (proof, f)
   }
@@ -281,30 +284,37 @@ where
   /// It also ensures a lack of determinable relation between keys, guaranteeing security in the
   /// currently expected use case for this, atomic swaps, where each swap leaks the key. Knowing
   /// the relationship between keys would allow breaking all swaps after just one.
+  #[allow(clippy::type_complexity)]
   pub fn prove<R: RngCore + CryptoRng, T: Clone + Transcript, D: Digest + HashMarker>(
     rng: &mut R,
     transcript: &mut T,
     generators: (Generators<G0>, Generators<G1>),
     digest: D,
-  ) -> (Self, (G0::Scalar, G1::Scalar)) {
-    Self::prove_internal(
-      rng,
-      transcript,
-      generators,
-      mutual_scalar_from_bytes(digest.finalize().as_ref()),
-    )
+  ) -> (Self, (Zeroizing<G0::Scalar>, Zeroizing<G1::Scalar>)) {
+    // This pattern theoretically prevents the compiler from moving it, so our protection against
+    // a copy remaining un-zeroized is actually what's causing a copy. There's still a feeling of
+    // safety granted by it, even if there's a loss in performance.
+    let (mut f0, mut f1) =
+      mutual_scalar_from_bytes::<G0::Scalar, G1::Scalar>(digest.finalize().as_ref());
+    let f = (Zeroizing::new(f0), Zeroizing::new(f1));
+    f0.zeroize();
+    f1.zeroize();
+
+    Self::prove_internal(rng, transcript, generators, f)
   }
 
   /// Prove the cross-Group Discrete Log Equality for the points derived from the scalar passed in,
   /// failing if it's not mutually valid. This allows for rejection sampling externally derived
   /// scalars until they're safely usable, as needed.
+  #[allow(clippy::type_complexity)]
   pub fn prove_without_bias<R: RngCore + CryptoRng, T: Clone + Transcript>(
     rng: &mut R,
     transcript: &mut T,
     generators: (Generators<G0>, Generators<G1>),
-    f0: G0::Scalar,
-  ) -> Option<(Self, (G0::Scalar, G1::Scalar))> {
-    scalar_convert(f0).map(|f1| Self::prove_internal(rng, transcript, generators, (f0, f1)))
+    f0: Zeroizing<G0::Scalar>,
+  ) -> Option<(Self, (Zeroizing<G0::Scalar>, Zeroizing<G1::Scalar>))> {
+    scalar_convert(*f0.deref()) // scalar_convert will zeroize it, though this is unfortunate
+      .map(|f1| Self::prove_internal(rng, transcript, generators, (f0, Zeroizing::new(f1))))
   }
 
   /// Verify a cross-Group Discrete Log Equality statement, returning the points proven for.
@@ -357,36 +367,32 @@ where
   }
 
   #[cfg(feature = "serialize")]
-  pub fn serialize<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
+  pub fn write<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
     for bit in &self.bits {
-      bit.serialize(w)?;
+      bit.write(w)?;
     }
     if let Some(bit) = &self.remainder {
-      bit.serialize(w)?;
+      bit.write(w)?;
     }
-    self.poks.0.serialize(w)?;
-    self.poks.1.serialize(w)
+    self.poks.0.write(w)?;
+    self.poks.1.write(w)
   }
 
   #[cfg(feature = "serialize")]
-  pub fn deserialize<R: Read>(r: &mut R) -> std::io::Result<Self> {
+  pub fn read<R: Read>(r: &mut R) -> std::io::Result<Self> {
     let capacity = usize::try_from(G0::Scalar::CAPACITY.min(G1::Scalar::CAPACITY)).unwrap();
     let bits_per_group = BitSignature::from(SIGNATURE).bits();
 
     let mut bits = Vec::with_capacity(capacity / bits_per_group);
     for _ in 0 .. (capacity / bits_per_group) {
-      bits.push(Bits::deserialize(r)?);
+      bits.push(Bits::read(r)?);
     }
 
     let mut remainder = None;
     if (capacity % bits_per_group) != 0 {
-      remainder = Some(Bits::deserialize(r)?);
+      remainder = Some(Bits::read(r)?);
     }
 
-    Ok(__DLEqProof {
-      bits,
-      remainder,
-      poks: (SchnorrPoK::deserialize(r)?, SchnorrPoK::deserialize(r)?),
-    })
+    Ok(__DLEqProof { bits, remainder, poks: (SchnorrPoK::read(r)?, SchnorrPoK::read(r)?) })
   }
 }

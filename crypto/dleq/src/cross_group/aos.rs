@@ -62,9 +62,9 @@ where
   #[allow(non_snake_case)]
   fn nonces<T: Transcript>(mut transcript: T, nonces: (G0, G1)) -> (G0::Scalar, G1::Scalar) {
     transcript.domain_separate(b"aos_membership_proof");
-    transcript.append_message(b"ring_len", &u8::try_from(RING_LEN).unwrap().to_le_bytes());
-    transcript.append_message(b"nonce_0", nonces.0.to_bytes().as_ref());
-    transcript.append_message(b"nonce_1", nonces.1.to_bytes().as_ref());
+    transcript.append_message(b"ring_len", u8::try_from(RING_LEN).unwrap().to_le_bytes());
+    transcript.append_message(b"nonce_0", nonces.0.to_bytes());
+    transcript.append_message(b"nonce_1", nonces.1.to_bytes());
     mutual_scalar_from_bytes(transcript.challenge(b"challenge").as_ref())
   }
 
@@ -78,7 +78,7 @@ where
     (((generators.0.alt * s.0) - (A.0 * e.0)), ((generators.1.alt * s.1) - (A.1 * e.1)))
   }
 
-  #[allow(non_snake_case)]
+  #[allow(non_snake_case, clippy::type_complexity)]
   fn R_batch(
     generators: (Generators<G0>, Generators<G1>),
     s: (G0::Scalar, G1::Scalar),
@@ -210,7 +210,7 @@ where
   }
 
   #[cfg(feature = "serialize")]
-  pub(crate) fn serialize<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
+  pub(crate) fn write<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
     #[allow(non_snake_case)]
     match self.Re_0 {
       Re::R(R0, R1) => {
@@ -230,7 +230,7 @@ where
 
   #[allow(non_snake_case)]
   #[cfg(feature = "serialize")]
-  pub(crate) fn deserialize<R: Read>(r: &mut R, mut Re_0: Re<G0, G1>) -> std::io::Result<Self> {
+  pub(crate) fn read<R: Read>(r: &mut R, mut Re_0: Re<G0, G1>) -> std::io::Result<Self> {
     match Re_0 {
       Re::R(ref mut R0, ref mut R1) => {
         *R0 = read_point(r)?;

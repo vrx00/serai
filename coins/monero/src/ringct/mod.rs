@@ -1,4 +1,7 @@
-use zeroize::Zeroize;
+use core::ops::Deref;
+use std::io::{self, Read, Write};
+
+use zeroize::Zeroizing;
 
 use curve25519_dalek::{constants::ED25519_BASEPOINT_TABLE, scalar::Scalar, edwards::EdwardsPoint};
 
@@ -17,10 +20,8 @@ use crate::{
 };
 
 /// Generate a key image for a given key. Defined as `x * hash_to_point(xG)`.
-pub fn generate_key_image(mut secret: Scalar) -> EdwardsPoint {
-  let res = secret * hash_to_point(&secret * &ED25519_BASEPOINT_TABLE);
-  secret.zeroize();
-  res
+pub fn generate_key_image(secret: &Zeroizing<Scalar>) -> EdwardsPoint {
+  hash_to_point(&ED25519_BASEPOINT_TABLE * secret.deref()) * secret.deref()
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -35,7 +36,7 @@ impl RctBase {
     1 + 8 + (outputs * (8 + 32))
   }
 
-  pub fn serialize<W: std::io::Write>(&self, w: &mut W, rct_type: u8) -> std::io::Result<()> {
+  pub fn write<W: Write>(&self, w: &mut W, rct_type: u8) -> io::Result<()> {
     w.write_all(&[rct_type])?;
     match rct_type {
       0 => Ok(()),
@@ -50,10 +51,7 @@ impl RctBase {
     }
   }
 
-  pub fn deserialize<R: std::io::Read>(
-    outputs: usize,
-    r: &mut R,
-  ) -> std::io::Result<(RctBase, u8)> {
+  pub fn read<R: Read>(outputs: usize, r: &mut R) -> io::Result<(RctBase, u8)> {
     let rct_type = read_byte(r)?;
     Ok((
       if rct_type == 0 {
@@ -96,46 +94,43 @@ impl RctPrunable {
       (inputs * (Clsag::fee_weight(protocol.ring_len()) + 32))
   }
 
-  pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+  pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
     match self {
       RctPrunable::Null => Ok(()),
       RctPrunable::Clsag { bulletproofs, clsags, pseudo_outs, .. } => {
-        write_vec(Bulletproofs::serialize, bulletproofs, w)?;
-        write_raw_vec(Clsag::serialize, clsags, w)?;
+        write_vec(Bulletproofs::write, bulletproofs, w)?;
+        write_raw_vec(Clsag::write, clsags, w)?;
         write_raw_vec(write_point, pseudo_outs, w)
       }
     }
   }
 
-  pub fn deserialize<R: std::io::Read>(
-    rct_type: u8,
-    decoys: &[usize],
-    r: &mut R,
-  ) -> std::io::Result<RctPrunable> {
+  pub fn serialize(&self) -> Vec<u8> {
+    let mut serialized = vec![];
+    self.write(&mut serialized).unwrap();
+    serialized
+  }
+
+  pub fn read<R: Read>(rct_type: u8, decoys: &[usize], r: &mut R) -> io::Result<RctPrunable> {
     Ok(match rct_type {
       0 => RctPrunable::Null,
       5 | 6 => RctPrunable::Clsag {
         bulletproofs: read_vec(
-          if rct_type == 5 { Bulletproofs::deserialize } else { Bulletproofs::deserialize_plus },
+          if rct_type == 5 { Bulletproofs::read } else { Bulletproofs::read_plus },
           r,
         )?,
-        clsags: (0 .. decoys.len())
-          .map(|o| Clsag::deserialize(decoys[o], r))
-          .collect::<Result<_, _>>()?,
+        clsags: (0 .. decoys.len()).map(|o| Clsag::read(decoys[o], r)).collect::<Result<_, _>>()?,
         pseudo_outs: read_raw_vec(read_point, decoys.len(), r)?,
       },
-      _ => Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "Tried to deserialize unknown RCT type",
-      ))?,
+      _ => Err(io::Error::new(io::ErrorKind::Other, "Tried to deserialize unknown RCT type"))?,
     })
   }
 
-  pub(crate) fn signature_serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+  pub(crate) fn signature_write<W: Write>(&self, w: &mut W) -> io::Result<()> {
     match self {
       RctPrunable::Null => panic!("Serializing RctPrunable::Null for a signature"),
       RctPrunable::Clsag { bulletproofs, .. } => {
-        bulletproofs.iter().try_for_each(|bp| bp.signature_serialize(w))
+        bulletproofs.iter().try_for_each(|bp| bp.signature_write(w))
       }
     }
   }
@@ -152,17 +147,19 @@ impl RctSignatures {
     RctBase::fee_weight(outputs) + RctPrunable::fee_weight(protocol, inputs, outputs)
   }
 
-  pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-    self.base.serialize(w, self.prunable.rct_type())?;
-    self.prunable.serialize(w)
+  pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    self.base.write(w, self.prunable.rct_type())?;
+    self.prunable.write(w)
   }
 
-  pub fn deserialize<R: std::io::Read>(
-    decoys: Vec<usize>,
-    outputs: usize,
-    r: &mut R,
-  ) -> std::io::Result<RctSignatures> {
-    let base = RctBase::deserialize(outputs, r)?;
-    Ok(RctSignatures { base: base.0, prunable: RctPrunable::deserialize(base.1, &decoys, r)? })
+  pub fn serialize(&self) -> Vec<u8> {
+    let mut serialized = vec![];
+    self.write(&mut serialized).unwrap();
+    serialized
+  }
+
+  pub fn read<R: Read>(decoys: Vec<usize>, outputs: usize, r: &mut R) -> io::Result<RctSignatures> {
+    let base = RctBase::read(outputs, r)?;
+    Ok(RctSignatures { base: base.0, prunable: RctPrunable::read(base.1, &decoys, r)? })
   }
 }

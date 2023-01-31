@@ -13,7 +13,6 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-hex-literal = "0.3"
 thiserror = "1"
 rand_core = "0.6"
 
@@ -28,10 +27,10 @@ frost = { package = "modular-frost", path = "../../crypto/frost", features = ["s
 
 eyre = "0.6"
 
-ethers = { version = "0.14", features = ["abigen", "ethers-solc"] }
+ethers = { version = "1", features = ["abigen", "ethers-solc"] }
 
 [build-dependencies]
-ethers-solc = "0.14"
+ethers-solc = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }

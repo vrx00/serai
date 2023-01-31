@@ -1,11 +1,12 @@
+use core::ops::Deref;
 use std::io::{self, Read};
 
 use rand_core::{RngCore, CryptoRng};
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 use subtle::ConstantTimeEq;
 
-use digest::Digest;
+use digest::{Digest, Output};
 
 use group::{
   ff::{Field, PrimeField},
@@ -40,8 +41,8 @@ pub trait Curve: Ciphersuite {
   const CONTEXT: &'static [u8];
 
   /// Hash the given dst and data to a byte vector. Used to instantiate H4 and H5.
-  fn hash_to_vec(dst: &[u8], data: &[u8]) -> Vec<u8> {
-    Self::H::digest([Self::CONTEXT, dst, data].concat()).as_ref().to_vec()
+  fn hash(dst: &[u8], data: &[u8]) -> Output<Self::H> {
+    Self::H::digest([Self::CONTEXT, dst, data].concat())
   }
 
   /// Field element from hash. Used during key gen and by other crates under Serai as a general
@@ -52,13 +53,13 @@ pub trait Curve: Ciphersuite {
   }
 
   /// Hash the message for the binding factor. H4 from the IETF draft.
-  fn hash_msg(msg: &[u8]) -> Vec<u8> {
-    Self::hash_to_vec(b"msg", msg)
+  fn hash_msg(msg: &[u8]) -> Output<Self::H> {
+    Self::hash(b"msg", msg)
   }
 
   /// Hash the commitments for the binding factor. H5 from the IETF draft.
-  fn hash_commitments(commitments: &[u8]) -> Vec<u8> {
-    Self::hash_to_vec(b"com", commitments)
+  fn hash_commitments(commitments: &[u8]) -> Output<Self::H> {
+    Self::hash(b"com", commitments)
   }
 
   /// Hash the commitments and message to calculate the binding factor. H1 from the IETF draft.
@@ -67,26 +68,29 @@ pub trait Curve: Ciphersuite {
   }
 
   /// Securely generate a random nonce. H3 from the IETF draft.
-  fn random_nonce<R: RngCore + CryptoRng>(mut secret: Self::F, rng: &mut R) -> Self::F {
-    let mut seed = vec![0; 32];
-    rng.fill_bytes(&mut seed);
+  fn random_nonce<R: RngCore + CryptoRng>(
+    secret: &Zeroizing<Self::F>,
+    rng: &mut R,
+  ) -> Zeroizing<Self::F> {
+    let mut seed = Zeroizing::new(vec![0; 32]);
+    rng.fill_bytes(seed.as_mut());
 
     let mut repr = secret.to_repr();
-    secret.zeroize();
 
     let mut res;
     while {
       seed.extend(repr.as_ref());
-      res = <Self as Curve>::hash_to_F(b"nonce", &seed);
+      res = Zeroizing::new(<Self as Curve>::hash_to_F(b"nonce", seed.deref()));
       res.ct_eq(&Self::F::zero()).into()
     } {
+      seed = Zeroizing::new(vec![0; 32]);
       rng.fill_bytes(&mut seed);
     }
 
     for i in repr.as_mut() {
       i.zeroize();
     }
-    seed.zeroize();
+
     res
   }
 

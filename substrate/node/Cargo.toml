@@ -12,42 +12,47 @@ publish = false
 name = "serai-node"
 
 [dependencies]
+async-trait = "0.1"
+
 clap = { version = "4", features = ["derive"] }
 
-sc-cli = { git = "https://github.com/serai-dex/substrate", features = ["wasmtime"] }
+jsonrpsee = { version = "0.16", features = ["server"] }
+
 sp-core = { git = "https://github.com/serai-dex/substrate" }
-sc-executor = { git = "https://github.com/serai-dex/substrate", features = ["wasmtime"] }
-sc-service = { git = "https://github.com/serai-dex/substrate", features = ["wasmtime"] }
-sc-telemetry = { git = "https://github.com/serai-dex/substrate" }
-sc-keystore = { git = "https://github.com/serai-dex/substrate" }
-sc-transaction-pool = { git = "https://github.com/serai-dex/substrate" }
-sc-transaction-pool-api = { git = "https://github.com/serai-dex/substrate" }
-sc-consensus = { git = "https://github.com/serai-dex/substrate" }
-sc-client-api = { git = "https://github.com/serai-dex/substrate" }
-sp-runtime = { git = "https://github.com/serai-dex/substrate" }
-sp-timestamp = { git = "https://github.com/serai-dex/substrate" }
-sp-inherents = { git = "https://github.com/serai-dex/substrate" }
 sp-keyring = { git = "https://github.com/serai-dex/substrate" }
-frame-system = { git = "https://github.com/serai-dex/substrate" }
-pallet-transaction-payment = { git = "https://github.com/serai-dex/substrate", default-features = false }
-
-# These dependencies are used for the node template's RPCs
-jsonrpsee = { version = "0.15", features = ["server"] }
-sc-rpc = { git = "https://github.com/serai-dex/substrate" }
-sp-api = { git = "https://github.com/serai-dex/substrate" }
-sc-rpc-api = { git = "https://github.com/serai-dex/substrate" }
+sp-inherents = { git = "https://github.com/serai-dex/substrate" }
+sp-runtime = { git = "https://github.com/serai-dex/substrate" }
 sp-blockchain = { git = "https://github.com/serai-dex/substrate" }
+sp-api = { git = "https://github.com/serai-dex/substrate" }
 sp-block-builder = { git = "https://github.com/serai-dex/substrate" }
-substrate-frame-rpc-system = { git = "https://github.com/serai-dex/substrate" }
-pallet-transaction-payment-rpc = { git = "https://github.com/serai-dex/substrate" }
+sp-consensus = { git = "https://github.com/serai-dex/substrate" }
 
-# These dependencies are used for runtime benchmarking
 frame-benchmarking = { git = "https://github.com/serai-dex/substrate" }
 frame-benchmarking-cli = { git = "https://github.com/serai-dex/substrate" }
 
-# Local dependencies
-serai-consensus = { path = "../consensus" }
 serai-runtime = { path = "../runtime" }
+
+sc-transaction-pool = { git = "https://github.com/serai-dex/substrate" }
+sc-transaction-pool-api = { git = "https://github.com/serai-dex/substrate" }
+sc-basic-authorship = { git = "https://github.com/serai-dex/substrate" }
+sc-executor = { git = "https://github.com/serai-dex/substrate" }
+sc-service = { git = "https://github.com/serai-dex/substrate" }
+sc-client-db = { git = "https://github.com/serai-dex/substrate" }
+sc-client-api = { git = "https://github.com/serai-dex/substrate" }
+sc-network = { git = "https://github.com/serai-dex/substrate" }
+sc-consensus = { git = "https://github.com/serai-dex/substrate" }
+
+sc-telemetry = { git = "https://github.com/serai-dex/substrate" }
+sc-cli = { git = "https://github.com/serai-dex/substrate" }
+
+sc-rpc-api = { git = "https://github.com/serai-dex/substrate" }
+
+substrate-frame-rpc-system = { git = "https://github.com/serai-dex/substrate" }
+pallet-transaction-payment-rpc = { git = "https://github.com/serai-dex/substrate" }
+
+in-instructions-client = { path = "../in-instructions/client" }
+
+sc-tendermint = { path = "../tendermint/client" }
 
 [build-dependencies]
 substrate-build-script-utils = { git = "https://github.com/serai-dex/substrate.git" }
@@ -57,5 +62,6 @@ default = []
 runtime-benchmarks = [
   "frame-benchmarking/runtime-benchmarks",
   "frame-benchmarking-cli/runtime-benchmarks",
-  "serai-runtime/runtime-benchmarks"
+
+  "serai-runtime/runtime-benchmarks",
 ]

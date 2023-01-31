@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+use core::{ops::Deref, fmt::Debug};
 use std::{
   io::{self, Read, Write},
   sync::{Arc, RwLock},
@@ -7,23 +7,23 @@ use std::{
 use rand_core::{RngCore, CryptoRng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use curve25519_dalek::{
-  constants::ED25519_BASEPOINT_TABLE,
   traits::{Identity, IsIdentity},
   scalar::Scalar,
   edwards::EdwardsPoint,
 };
 
-use group::{Group, GroupEncoding};
+use group::{ff::Field, Group, GroupEncoding};
 
 use transcript::{Transcript, RecommendedTranscript};
 use dalek_ff_group as dfg;
 use dleq::DLEqProof;
 use frost::{
+  dkg::lagrange,
   curve::Ed25519,
-  FrostError, ThresholdView,
+  FrostError, ThresholdKeys, ThresholdView,
   algorithm::{WriteAddendum, Algorithm},
 };
 
@@ -41,18 +41,17 @@ impl ClsagInput {
     // Doesn't domain separate as this is considered part of the larger CLSAG proof
 
     // Ring index
-    transcript.append_message(b"ring_index", &[self.decoys.i]);
+    transcript.append_message(b"real_spend", [self.decoys.i]);
 
     // Ring
-    let mut ring = vec![];
-    for pair in &self.decoys.ring {
+    for (i, pair) in self.decoys.ring.iter().enumerate() {
       // Doesn't include global output indexes as CLSAG doesn't care and won't be affected by it
       // They're just a unreliable reference to this data which will be included in the message
       // if in use
-      ring.extend(pair[0].compress().to_bytes());
-      ring.extend(pair[1].compress().to_bytes());
+      transcript.append_message(b"member", [u8::try_from(i).expect("ring size exceeded 255")]);
+      transcript.append_message(b"key", pair[0].compress().to_bytes());
+      transcript.append_message(b"commitment", pair[1].compress().to_bytes())
     }
-    transcript.append_message(b"ring", &ring);
 
     // Doesn't include the commitment's parts as the above ring + index includes the commitment
     // The only potential malleability would be if the G/H relationship is known breaking the
@@ -83,7 +82,7 @@ pub struct ClsagAddendum {
 impl WriteAddendum for ClsagAddendum {
   fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
     writer.write_all(self.key_image.compress().to_bytes().as_ref())?;
-    self.dleq.serialize(writer)
+    self.dleq.write(writer)
   }
 }
 
@@ -103,7 +102,7 @@ struct Interim {
 pub struct ClsagMultisig {
   transcript: RecommendedTranscript,
 
-  H: EdwardsPoint,
+  pub(crate) H: EdwardsPoint,
   // Merged here as CLSAG needs it, passing it would be a mess, yet having it beforehand requires
   // an extra round
   image: EdwardsPoint,
@@ -142,6 +141,20 @@ impl ClsagMultisig {
   }
 }
 
+pub(crate) fn add_key_image_share(
+  image: &mut EdwardsPoint,
+  generator: EdwardsPoint,
+  offset: Scalar,
+  included: &[u16],
+  participant: u16,
+  share: EdwardsPoint,
+) {
+  if image.is_identity() {
+    *image = generator * offset;
+  }
+  *image += share * lagrange::<dfg::Scalar>(participant, included).0;
+}
+
 impl Algorithm<Ed25519> for ClsagMultisig {
   type Transcript = RecommendedTranscript;
   type Addendum = ClsagAddendum;
@@ -154,10 +167,10 @@ impl Algorithm<Ed25519> for ClsagMultisig {
   fn preprocess_addendum<R: RngCore + CryptoRng>(
     &mut self,
     rng: &mut R,
-    view: &ThresholdView<Ed25519>,
+    keys: &ThresholdKeys<Ed25519>,
   ) -> ClsagAddendum {
     ClsagAddendum {
-      key_image: dfg::EdwardsPoint(self.H * view.secret_share().0),
+      key_image: dfg::EdwardsPoint(self.H) * keys.secret_share().deref(),
       dleq: DLEqProof::prove(
         rng,
         // Doesn't take in a larger transcript object due to the usage of this
@@ -167,7 +180,7 @@ impl Algorithm<Ed25519> for ClsagMultisig {
         // try to merge later in some form, when it should instead just merge xH (as it does)
         &mut dleq_transcript(),
         &[dfg::EdwardsPoint::generator(), dfg::EdwardsPoint(self.H)],
-        dfg::Scalar(view.secret_share().0),
+        keys.secret_share(),
       ),
     }
   }
@@ -183,7 +196,7 @@ impl Algorithm<Ed25519> for ClsagMultisig {
       Err(io::Error::new(io::ErrorKind::Other, "non-canonical key image"))?;
     }
 
-    Ok(ClsagAddendum { key_image: xH, dleq: DLEqProof::<dfg::EdwardsPoint>::deserialize(reader)? })
+    Ok(ClsagAddendum { key_image: xH, dleq: DLEqProof::<dfg::EdwardsPoint>::read(reader)? })
   }
 
   fn process_addendum(
@@ -195,24 +208,29 @@ impl Algorithm<Ed25519> for ClsagMultisig {
     if self.image.is_identity() {
       self.transcript.domain_separate(b"CLSAG");
       self.input().transcript(&mut self.transcript);
-      self.transcript.append_message(b"mask", &self.mask().to_bytes());
+      self.transcript.append_message(b"mask", self.mask().to_bytes());
     }
 
-    self.transcript.append_message(b"participant", &l.to_be_bytes());
+    self.transcript.append_message(b"participant", l.to_be_bytes());
 
     addendum
       .dleq
       .verify(
         &mut dleq_transcript(),
         &[dfg::EdwardsPoint::generator(), dfg::EdwardsPoint(self.H)],
-        &[view.verification_share(l), addendum.key_image],
+        &[view.original_verification_share(l), addendum.key_image],
       )
       .map_err(|_| FrostError::InvalidPreprocess(l))?;
 
-    self
-      .transcript
-      .append_message(b"key_image_share", addendum.key_image.compress().to_bytes().as_ref());
-    self.image += addendum.key_image.0;
+    self.transcript.append_message(b"key_image_share", addendum.key_image.compress().to_bytes());
+    add_key_image_share(
+      &mut self.image,
+      self.H,
+      view.offset().0,
+      view.included(),
+      l,
+      addendum.key_image.0,
+    );
 
     Ok(())
   }
@@ -225,7 +243,7 @@ impl Algorithm<Ed25519> for ClsagMultisig {
     &mut self,
     view: &ThresholdView<Ed25519>,
     nonce_sums: &[Vec<dfg::EdwardsPoint>],
-    nonces: &[dfg::Scalar],
+    nonces: Vec<Zeroizing<dfg::Scalar>>,
     msg: &[u8],
   ) -> dfg::Scalar {
     // Use the transcript to get a seeded random number generator
@@ -249,7 +267,7 @@ impl Algorithm<Ed25519> for ClsagMultisig {
     );
     self.interim = Some(Interim { p, c, clsag, pseudo_out });
 
-    nonces[0] - (dfg::Scalar(p) * view.secret_share())
+    (-(dfg::Scalar(p) * view.secret_share().deref())) + nonces[0].deref()
   }
 
   #[must_use]
@@ -276,14 +294,17 @@ impl Algorithm<Ed25519> for ClsagMultisig {
     None
   }
 
-  #[must_use]
   fn verify_share(
     &self,
     verification_share: dfg::EdwardsPoint,
     nonces: &[Vec<dfg::EdwardsPoint>],
     share: dfg::Scalar,
-  ) -> bool {
+  ) -> Result<Vec<(dfg::Scalar, dfg::EdwardsPoint)>, ()> {
     let interim = self.interim.as_ref().unwrap();
-    (&share.0 * &ED25519_BASEPOINT_TABLE) == (nonces[0][0].0 - (interim.p * verification_share.0))
+    Ok(vec![
+      (share, dfg::EdwardsPoint::generator()),
+      (dfg::Scalar(interim.p), verification_share),
+      (-dfg::Scalar::one(), nonces[0][0]),
+    ])
   }
 }

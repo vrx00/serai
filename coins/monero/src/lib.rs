@@ -56,18 +56,20 @@ mod tests;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Zeroize)]
 #[allow(non_camel_case_types)]
 pub enum Protocol {
-  Unsupported,
+  Unsupported(usize),
   v14,
   v16,
+  Custom { ring_len: usize, bp_plus: bool },
 }
 
 impl Protocol {
   /// Amount of ring members under this protocol version.
   pub fn ring_len(&self) -> usize {
     match self {
-      Protocol::Unsupported => panic!("Unsupported protocol version"),
+      Protocol::Unsupported(_) => panic!("Unsupported protocol version"),
       Protocol::v14 => 11,
       Protocol::v16 => 16,
+      Protocol::Custom { ring_len, .. } => *ring_len,
     }
   }
 
@@ -75,9 +77,10 @@ impl Protocol {
   /// This method will likely be reworked when versions not using Bulletproofs at all are added.
   pub fn bp_plus(&self) -> bool {
     match self {
-      Protocol::Unsupported => panic!("Unsupported protocol version"),
+      Protocol::Unsupported(_) => panic!("Unsupported protocol version"),
       Protocol::v14 => false,
       Protocol::v16 => true,
+      Protocol::Custom { bp_plus, .. } => *bp_plus,
     }
   }
 }
@@ -128,6 +131,6 @@ pub fn hash_to_scalar(data: &[u8]) -> Scalar {
   // This library acknowledges its practical impossibility of it occurring, and doesn't bother to
   // code in logic to handle it. That said, if it ever occurs, something must happen in order to
   // not generate/verify a proof we believe to be valid when it isn't
-  assert!(scalar != Scalar::zero(), "ZERO HASH: {:?}", data);
+  assert!(scalar != Scalar::zero(), "ZERO HASH: {data:?}");
   scalar
 }

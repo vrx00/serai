@@ -1,11 +1,15 @@
+use core::ops::Deref;
+
 use thiserror::Error;
 
 use rand_core::{RngCore, CryptoRng};
 use rand::seq::SliceRandom;
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use group::Group;
 use curve25519_dalek::{constants::ED25519_BASEPOINT_TABLE, scalar::Scalar, edwards::EdwardsPoint};
+use dalek_ff_group as dfg;
 
 #[cfg(feature = "multisig")]
 use frost::FrostError;
@@ -21,10 +25,13 @@ use crate::{
   transaction::{Input, Output, Timelock, TransactionPrefix, Transaction},
   rpc::{Rpc, RpcError},
   wallet::{
-    address::Address, SpendableOutput, Decoys, PaymentId, ExtraField, Extra, key_image_sort,
-    uniqueness, shared_key, commitment_mask, amount_encryption,
+    address::MoneroAddress, SpendableOutput, Decoys, PaymentId, ExtraField, Extra, key_image_sort,
+    uniqueness, shared_key, commitment_mask, amount_encryption, extra::MAX_TX_EXTRA_NONCE_SIZE,
   },
 };
+
+mod builder;
+pub use builder::SignableTransactionBuilder;
 
 #[cfg(feature = "multisig")]
 mod multisig;
@@ -42,24 +49,23 @@ struct SendOutput {
 }
 
 impl SendOutput {
-  fn new<R: RngCore + CryptoRng>(
-    rng: &mut R,
+  fn new(
+    r: &Zeroizing<Scalar>,
     unique: [u8; 32],
-    output: (usize, (Address, u64)),
+    output: (usize, (MoneroAddress, u64)),
   ) -> (SendOutput, Option<[u8; 8]>) {
     let o = output.0;
     let output = output.1;
 
-    let r = random_scalar(rng);
     let (view_tag, shared_key, payment_id_xor) =
-      shared_key(Some(unique).filter(|_| output.0.meta.kind.guaranteed()), &r, &output.0.view, o);
+      shared_key(Some(unique).filter(|_| output.0.is_guaranteed()), r, &output.0.view, o);
 
     (
       SendOutput {
-        R: if !output.0.meta.kind.subaddress() {
-          &r * &ED25519_BASEPOINT_TABLE
+        R: if !output.0.is_subaddress() {
+          r.deref() * &ED25519_BASEPOINT_TABLE
         } else {
-          r * output.0.spend
+          r.deref() * output.0.spend
         },
         view_tag,
         dest: ((&shared_key * &ED25519_BASEPOINT_TABLE) + output.0.spend),
@@ -74,7 +80,7 @@ impl SendOutput {
   }
 }
 
-#[derive(Clone, Error, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Error)]
 pub enum TransactionError {
   #[error("multiple addresses with payment IDs")]
   MultiplePaymentIds,
@@ -108,9 +114,9 @@ async fn prepare_inputs<R: RngCore + CryptoRng>(
   rpc: &Rpc,
   ring_len: usize,
   inputs: &[SpendableOutput],
-  spend: &Scalar,
+  spend: &Zeroizing<Scalar>,
   tx: &mut Transaction,
-) -> Result<Vec<(Scalar, EdwardsPoint, ClsagInput)>, TransactionError> {
+) -> Result<Vec<(Zeroizing<Scalar>, EdwardsPoint, ClsagInput)>, TransactionError> {
   let mut signable = Vec::with_capacity(inputs.len());
 
   // Select decoys
@@ -125,9 +131,11 @@ async fn prepare_inputs<R: RngCore + CryptoRng>(
   .map_err(TransactionError::RpcError)?;
 
   for (i, input) in inputs.iter().enumerate() {
+    let input_spend = Zeroizing::new(input.key_offset() + spend.deref());
+    let image = generate_key_image(&input_spend);
     signable.push((
-      spend + input.key_offset(),
-      generate_key_image(spend + input.key_offset()),
+      input_spend,
+      image,
       ClsagInput::new(input.commitment().clone(), decoys[i].clone())
         .map_err(TransactionError::ClsagError)?,
     ));
@@ -152,7 +160,7 @@ async fn prepare_inputs<R: RngCore + CryptoRng>(
 }
 
 /// Fee struct, defined as a per-unit cost and a mask for rounding purposes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Zeroize)]
 pub struct Fee {
   pub per_weight: u64,
   pub mask: u64,
@@ -169,8 +177,8 @@ impl Fee {
 pub struct SignableTransaction {
   protocol: Protocol,
   inputs: Vec<SpendableOutput>,
-  payments: Vec<(Address, u64)>,
-  data: Option<Vec<u8>>,
+  payments: Vec<(MoneroAddress, u64)>,
+  data: Vec<Vec<u8>>,
   fee: u64,
 }
 
@@ -182,15 +190,15 @@ impl SignableTransaction {
   pub fn new(
     protocol: Protocol,
     inputs: Vec<SpendableOutput>,
-    mut payments: Vec<(Address, u64)>,
-    change_address: Option<Address>,
-    data: Option<Vec<u8>>,
+    mut payments: Vec<(MoneroAddress, u64)>,
+    change_address: Option<MoneroAddress>,
+    data: Vec<Vec<u8>>,
     fee_rate: Fee,
   ) -> Result<SignableTransaction, TransactionError> {
     // Make sure there's only one payment ID
     {
       let mut payment_ids = 0;
-      let mut count = |addr: Address| {
+      let mut count = |addr: MoneroAddress| {
         if addr.payment_id().is_some() {
           payment_ids += 1
         }
@@ -213,8 +221,10 @@ impl SignableTransaction {
       Err(TransactionError::NoOutputs)?;
     }
 
-    if data.as_ref().map(|v| v.len()).unwrap_or(0) > 255 {
-      Err(TransactionError::TooMuchData)?;
+    for part in &data {
+      if part.len() > MAX_TX_EXTRA_NONCE_SIZE {
+        Err(TransactionError::TooMuchData)?;
+      }
     }
 
     // TODO TX MAX SIZE
@@ -272,11 +282,26 @@ impl SignableTransaction {
     // Shuffle the payments
     self.payments.shuffle(rng);
 
+    // Used for all non-subaddress outputs, or if there's only one subaddress output and a change
+    let tx_key = Zeroizing::new(random_scalar(rng));
+    // TODO: Support not needing additional when one subaddress and non-subaddress change
+    let additional = self.payments.iter().filter(|payment| payment.0.is_subaddress()).count() != 0;
+
     // Actually create the outputs
     let mut outputs = Vec::with_capacity(self.payments.len());
     let mut id = None;
     for payment in self.payments.drain(..).enumerate() {
-      let (output, payment_id) = SendOutput::new(rng, uniqueness, payment);
+      // If this is a subaddress, generate a dedicated r. Else, reuse the TX key
+      let dedicated = Zeroizing::new(random_scalar(&mut *rng));
+      let use_dedicated = additional && payment.1 .0.is_subaddress();
+      let r = if use_dedicated { &dedicated } else { &tx_key };
+
+      let (mut output, payment_id) = SendOutput::new(r, uniqueness, payment);
+      // If this used the tx_key, randomize its R
+      if !use_dedicated {
+        output.R = dfg::EdwardsPoint::random(&mut *rng).0;
+      }
+
       outputs.push(output);
       id = id.or(payment_id);
     }
@@ -299,19 +324,22 @@ impl SignableTransaction {
 
     // Create the TX extra
     let extra = {
-      let mut extra = Extra::new(outputs.iter().map(|output| output.R).collect());
+      let mut extra = Extra::new(
+        tx_key.deref() * &ED25519_BASEPOINT_TABLE,
+        if additional { outputs.iter().map(|output| output.R).collect() } else { vec![] },
+      );
 
       let mut id_vec = Vec::with_capacity(1 + 8);
-      PaymentId::Encrypted(id).serialize(&mut id_vec).unwrap();
+      PaymentId::Encrypted(id).write(&mut id_vec).unwrap();
       extra.push(ExtraField::Nonce(id_vec));
 
       // Include data if present
-      if let Some(data) = self.data.take() {
-        extra.push(ExtraField::Nonce(data));
+      for part in self.data.drain(..) {
+        extra.push(ExtraField::Nonce(part));
       }
 
       let mut serialized = Vec::with_capacity(Extra::fee_weight(outputs.len(), self.data.as_ref()));
-      extra.serialize(&mut serialized).unwrap();
+      extra.write(&mut serialized).unwrap();
       serialized
     };
 
@@ -355,19 +383,19 @@ impl SignableTransaction {
 
   /// Sign this transaction.
   pub async fn sign<R: RngCore + CryptoRng>(
-    &mut self,
+    mut self,
     rng: &mut R,
     rpc: &Rpc,
-    spend: &Scalar,
+    spend: &Zeroizing<Scalar>,
   ) -> Result<Transaction, TransactionError> {
     let mut images = Vec::with_capacity(self.inputs.len());
     for input in &self.inputs {
-      let mut offset = spend + input.key_offset();
-      if (&offset * &ED25519_BASEPOINT_TABLE) != input.key() {
+      let mut offset = Zeroizing::new(spend.deref() + input.key_offset());
+      if (offset.deref() * &ED25519_BASEPOINT_TABLE) != input.key() {
         Err(TransactionError::WrongPrivateKey)?;
       }
 
-      images.push(generate_key_image(offset));
+      images.push(generate_key_image(&offset));
       offset.zeroize();
     }
     images.sort_by(key_image_sort);

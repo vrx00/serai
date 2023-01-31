@@ -1,3 +1,4 @@
+use core::ops::Deref;
 use std::collections::HashMap;
 
 use rand_core::{RngCore, CryptoRng};
@@ -38,7 +39,7 @@ pub fn recover_key<C: Ciphersuite>(keys: &HashMap<u16, ThresholdKeys<C>>) -> C::
   let included = keys.keys().cloned().collect::<Vec<_>>();
 
   let group_private = keys.iter().fold(C::F::zero(), |accum, (i, keys)| {
-    accum + (keys.secret_share() * lagrange::<C::F>(*i, &included))
+    accum + (lagrange::<C::F>(*i, &included) * keys.secret_share().deref())
   });
   assert_eq!(C::generator() * group_private, first.group_key(), "failed to recover keys");
   group_private
@@ -66,4 +67,9 @@ pub fn key_gen<R: RngCore + CryptoRng, C: Ciphersuite>(
 pub fn test_ciphersuite<R: RngCore + CryptoRng, C: Ciphersuite>(rng: &mut R) {
   key_gen::<_, C>(rng);
   test_generator_promotion::<_, C>(rng);
+}
+
+#[test]
+fn test_with_ristretto() {
+  test_ciphersuite::<_, ciphersuite::Ristretto>(&mut rand_core::OsRng);
 }
