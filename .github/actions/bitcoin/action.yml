@@ -53,11 +53,3 @@ runs:
         bitcoin-cli -regtest -rpcuser=$RPC_USER -rpcpassword=$RPC_PASS createwallet "miner" false false $RPC_PASS false false true &&
         bitcoin-cli -regtest -rpcuser=$RPC_USER -rpcpassword=$RPC_PASS walletpassphrase $RPC_PASS 60 &&
         bitcoin-cli -regtest -rpcuser=$RPC_USER -rpcpassword=$RPC_PASS importprivkey $PRIV_KEY
-
-        # mine a new block every BLOCK_TIME
-        while true
-        do
-          bitcoin-cli -regtest -rpcuser=$RPC_USER -rpcpassword=$RPC_PASS generatetoaddress 1 $MINER
-          sleep $BLOCK_TIME
-        done
-
