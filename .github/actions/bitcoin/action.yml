@@ -19,26 +19,16 @@ runs:
 
     - name: Download the Bitcoin Daemon
       if: steps.cache-bitcoind.outputs.cache-hit != 'true'
-      # Calculates OS/ARCH to demonstrate it, yet then locks to linux-x64 due
-      # to the contained folder not following the same naming scheme and
-      # requiring further expansion not worth doing right now
       shell: bash
       run: |
-        RUNNER_OS=${{ runner.os }}
-        RUNNER_ARCH=${{ runner.arch }}
-
-        RUNNER_OS=${RUNNER_OS,,}
-        RUNNER_ARCH=${RUNNER_ARCH,,}
-
         RUNNER_OS=linux
         RUNNER_ARCH=x86_64
 
-        BASE=bitcoin-${{ inputs.version }}
         FILE=$BASE-$RUNNER_ARCH-$RUNNER_OS-gnu.tar.gz
         wget https://bitcoincore.org/bin/bitcoin-core-${{ inputs.version }}/$FILE
         tar xzvf $FILE
 
-        cd $BASE
+        cd bitcoin-${{ inputs.version }}
         sudo mv bin/* /bin && sudo mv lib/* /lib
 
     - name: Bitcoin Regtest Daemon
