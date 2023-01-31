@@ -1,9 +1,9 @@
-name: Bitcoin Tests
+name: Processor Tests
 
 on:
   push:
     branches:
-      - develop
+      - test-branch
 
 jobs:
   # Only run these once since they will be consistent regardless of any node
