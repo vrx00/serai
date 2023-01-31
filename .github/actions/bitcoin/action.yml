@@ -39,7 +39,7 @@ runs:
         tar xzvf $FILE
 
         cd $BASE
-        sudo mv bin/* /bin && mv lib/* /lib && mv share/* /share
+        sudo mv bin/* /bin && sudo mv lib/* /lib && sudo mv share/* /share
 
     - name: Bitcoin Regtest Daemon
       shell: bash
